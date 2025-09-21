@@ -19,16 +19,14 @@ jobs:
         netsh advfirewall firewall delete rule name="RDP-Tailscale"
         netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
         Restart-Service -Name TermService -Force
-        # Increase PageFile
-        $pageFileSizeMB = 8192
-        wmic computersystem where name="%computername%" set AutomaticManagedPagefile=False
-        wmic pagefileset where name="C:\\pagefile.sys" set InitialSize=$pageFileSizeMB,MaximumSize=$pageFileSizeMB
-        Write-Host "PageFile set to $pageFileSizeMB MB"
-        # Expand virtual disk to 40GB
-        $vhdPath = "C:\Users\runneradmin\VirtualDisk.vhdx"
-        New-VHD -Path $vhdPath -SizeBytes 40GB -Dynamic
-        Mount-VHD -Path $vhdPath
-        Initialize-Disk -Number (Get-Disk | Where PartitionStyle -Eq 'RAW').Number -PartitionStyle GPT -PassThru | New-Partition -UseMaximumSize -AssignDriveLetter | Format-Volume -FileSystem NTFS -Force
+        # Set PageFile to 8GB using PowerShell
+        $computer = Get-CimInstance -ClassName Win32_ComputerSystem
+        $computer.AutomaticManagedPagefile = $false
+        Set-CimInstance -InputObject $computer
+        $pageFile = Get-CimInstance -ClassName Win32_PageFileSetting
+        if (-not $pageFile) { New-CimInstance -ClassName Win32_PageFileSetting -Property @{Name="C:\pagefile.sys"; InitialSize=8192; MaximumSize=8192} }
+        else { $pageFile.InitialSize=8192; $pageFile.MaximumSize=8192; Set-CimInstance -InputObject $pageFile }
+        Write-Host "PageFile set to 8192 MB"
 
     - name: Create RDP User
       run: |
