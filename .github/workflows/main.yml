@@ -1,85 +1,83 @@
-name: Setup RDP Full
+name: Ultimate RDP Setup
 on:
   workflow_dispatch:
-
 jobs:
-  run-setup:
-    runs-on: self-hosted
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Configure Core RDP and Performance
+      run: |
+        # Enable RDP
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+        # Disable NLA for simplicity
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+        # Improve RDP performance
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Terminal Server Client' -Name "Compression" -Value 1 -Force
+        # Firewall rule
+        netsh advfirewall firewall delete rule name="RDP-Tailscale"
+        netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+        Restart-Service -Name TermService -Force
+        # Increase PageFile
+        $pageFileSizeMB = 8192
+        wmic computersystem where name="%computername%" set AutomaticManagedPagefile=False
+        wmic pagefileset where name="C:\\pagefile.sys" set InitialSize=$pageFileSizeMB,MaximumSize=$pageFileSizeMB
+        Write-Host "PageFile set to $pageFileSizeMB MB"
+        # Expand virtual disk to 40GB
+        $vhdPath = "C:\Users\runneradmin\VirtualDisk.vhdx"
+        New-VHD -Path $vhdPath -SizeBytes 40GB -Dynamic
+        Mount-VHD -Path $vhdPath
+        Initialize-Disk -Number (Get-Disk | Where PartitionStyle -Eq 'RAW').Number -PartitionStyle GPT -PassThru | New-Partition -UseMaximumSize -AssignDriveLetter | Format-Volume -FileSystem NTFS -Force
 
-      - name: Run setup-rdp.ps1 script
-        shell: powershell
-        run: |
-          # التحقق من وجود السكربت
-          $scriptPath = "$GITHUB_WORKSPACE\setup-rdp.ps1"
-          if (-not (Test-Path $scriptPath)) {
-              Write-Error "setup-rdp.ps1 not found in repo root."
-              exit 1
-          }
+    - name: Create RDP User
+      run: |
+        $username = "ADMINSUPER"
+        $password = "UltraRdp@2025!"
+        $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+        if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) { New-LocalUser -Name $username -Password $securePass -AccountNeverExpires }
+        Add-LocalGroupMember -Group "Administrators" -Member $username
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+        echo "RDP_CREDS=User: $username | Password: $password" >> $env:GITHUB_ENV
+        if (-not (Get-LocalUser -Name $username)) { Write-Error "User creation failed"; exit 1 }
 
-          Write-Host "========== بدء تنفيذ setup-rdp.ps1 ==========" -ForegroundColor Cyan
+    - name: Install Tailscale
+      run: |
+        $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+        $installerPath = "$env:TEMP\tailscale.msi"
+        Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+        Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+        Remove-Item $installerPath -Force
 
-          # ---- 1) تفعيل Remote Desktop ----
-          Write-Host "🔹 تفعيل Remote Desktop..."
-          try {
-              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-              Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-              Write-Host "✅ RDP مفعل وقواعد الجدار الناري مفعلة."
-          } catch {
-              Write-Host "⚠️ فشل تفعيل RDP: $_" -ForegroundColor Yellow
-          }
+    - name: Install Developer Tools
+      run: |
+        winget install --id Git.Git -e --source winget
+        winget install --id Microsoft.VisualStudioCode -e --source winget
+        winget install --id Python.Python.3.12 -e --source winget
+        winget install --id OpenJS.NodeJS.LTS -e --source winget
+        winget install --id Microsoft.DotNet.SDK.8 -e --source winget
 
-          # ---- 2) إنشاء / تحديث المستخدم ----
-          $username = "MURTADALAW"
-          $plainPassword = "11qazz@$C"
+    - name: Establish Tailscale Connection
+      run: |
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+        $tsIP = $null
+        $retries = 0
+        while (-not $tsIP -and $retries -lt 10) { $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4; Start-Sleep -Seconds 5; $retries++ }
+        if (-not $tsIP) { Write-Error "Tailscale IP not assigned. Exiting."; exit 1 }
+        echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-          Write-Host "🔹 إعداد المستخدم: $username"
-          try {
-              $securePass = ConvertTo-SecureString $plainPassword -AsPlainText -Force
-              if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-                  New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -Description "RDP user created by setup-rdp.ps1"
-                  Write-Host "✅ تم إنشاء المستخدم $username"
-              } else {
-                  $u = Get-LocalUser -Name $username
-                  $u | Set-LocalUser -Password $securePass
-                  Write-Host "ℹ️ المستخدم موجود — تم تحديث كلمة المرور."
-              }
+    - name: Verify RDP
+      run: |
+        Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+        $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+        if (-not $testResult.TcpTestSucceeded) { Write-Error "TCP connection to RDP port 3389 failed"; exit 1 }
+        Write-Host "TCP connectivity successful!"
 
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
-              Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
-          } catch {
-              Write-Host "⚠️ فشل إعداد المستخدم: $_" -ForegroundColor Yellow
-          }
-
-          # ---- 3) تحسين الأداء ----
-          Write-Host "🔹 تحسين الأداء: تعطيل مؤثرات بصرية وبعض الخدمات الخفيفة"
-          try {
-              RunDll32.exe shell32.dll,Control_RunDLL desk.cpl,,@Themes /Action:OpenTheme
-          } catch {
-              # ليس خطأ قاتل
-          }
-
-          # ---- 4) تثبيت الأدوات الأساسية ----
-          Write-Host "🔹 تثبيت الأدوات الأساسية (Git, Python, Node LTS, .NET SDK)..."
-          try {
-              try { winget upgrade --all --silent } catch { }
-
-              $apps = @("Git.Git", "Python.Python.3.12", "OpenJS.NodeJS.LTS", "Microsoft.DotNet.SDK.8")
-              foreach ($app in $apps) {
-                  Write-Host "➡️ تثبيت $app ..."
-                  winget install --id $app -e --silent --accept-package-agreements --accept-source-agreements -h
-              }
-              Write-Host "✅ تثبيت الأدوات الأساسية انتهى."
-          } catch {
-              Write-Host "⚠️ حدثت أخطاء أثناء تثبيت الأدوات: $_" -ForegroundColor Yellow
-          }
-
-          # ---- 5) النتيجة النهائية ----
-          Write-Host "=============================================" -ForegroundColor Cyan
-          Write-Host "إعداد RDP انتهى. معلومات الدخول:" -ForegroundColor Green
-          Write-Host "  ➤ Username: $username"
-          Write-Host "  ➤ Password: $plainPassword"
-          Write-Host "ملاحظة: للوصول من خارج الشبكة استخدم Tailscale أو VPN." -ForegroundColor Yellow
-          Write-Host "=============================================" -ForegroundColor Cyan
+    - name: Maintain Connection
+      run: |
+        Write-Host "`n=== RDP ACCESS ==="
+        Write-Host "Address: $env:TAILSCALE_IP"
+        Write-Host "Username: ADMINSUPER"
+        Write-Host "Password: UltraRdp@2025!"
+        Write-Host "==================`n"
+        while ($true) { Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"; Start-Sleep -Seconds 300 }
